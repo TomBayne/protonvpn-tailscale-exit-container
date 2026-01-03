@@ -1,0 +1,102 @@
+version: "3.9"
+
+services:
+  gluetun:
+    image: qmcgaw/gluetun:v3
+    container_name: protonvpn-gateway
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    restart: unless-stopped
+
+    networks:
+      vpnnet:
+        ipv4_address: 172.30.0.2
+
+    environment:
+      - TZ=Europe/London
+
+      - VPN_SERVICE_PROVIDER=protonvpn
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${PROTON_OPENVPN_USER}
+      - OPENVPN_PASSWORD=${PROTON_OPENVPN_PASSWORD}
+
+      - SERVER_COUNTRIES=${PROTON_SERVER_COUNTRIES:-United Kingdom}
+      - SERVER_CITIES=${PROTON_SERVER_CITIES:-}
+
+      # Optional, keep if you want Gluetun's built-in kill-switch behaviour
+      - FIREWALL=on
+
+    volumes:
+      - gluetun-state:/gluetun
+
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale-exitnode
+    network_mode: host
+    restart: unless-stopped
+
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_HOSTNAME=${TS_HOSTNAME:-proton-exitnode}
+      - TS_USERSPACE=false
+      - TS_ACCEPT_DNS=true
+      - TS_EXTRA_ARGS=--advertise-exit-node
+
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+
+  netsetup:
+    image: alpine:3.20
+    container_name: tailscale-vpn-policy-routing
+    network_mode: host
+    restart: unless-stopped
+    privileged: true
+    depends_on:
+      - gluetun
+      - tailscale
+    command: >
+      sh -euxc '
+        apk add --no-cache iptables iproute2;
+
+        # Exit nodes require forwarding
+        sysctl -w net.ipv4.ip_forward=1;
+
+        # Wait until tailscale0 exists
+        for i in $(seq 1 60); do ip link show tailscale0 && break || sleep 1; done;
+
+        # Mark packets arriving from tailnet peers
+        iptables -t mangle -C PREROUTING -i tailscale0 -j MARK --set-mark 0x1 2>/dev/null ||
+          iptables -t mangle -A PREROUTING -i tailscale0 -j MARK --set-mark 0x1;
+
+        # Policy-route marked packets via the Gluetun container on br-vpnnet
+        ip rule show | grep -q "fwmark 0x1.*lookup 100" ||
+          ip rule add fwmark 0x1 table 100 priority 10000;
+
+        ip route replace default via 172.30.0.2 dev br-vpnnet table 100;
+
+        # Keep running
+        tail -f /dev/null
+      '
+
+networks:
+  vpnnet:
+    driver: bridge
+    name: vpnnet
+    driver_opts:
+      com.docker.network.bridge.name: br-vpnnet
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  gluetun-state:
+  tailscale-state:
