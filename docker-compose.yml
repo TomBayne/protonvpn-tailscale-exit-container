@@ -1,84 +1,150 @@
-version: "3.9"
+# ProtonVPN + Tailscale Exit Node with Split Tunneling
 
 services:
   gluetun:
     image: qmcgaw/gluetun:v3
     container_name: protonvpn-gateway
+    restart: unless-stopped
     cap_add:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    restart: unless-stopped
-
-    networks:
-      vpnnet:
-        ipv4_address: 172.30.0.2
-
+    sysctls:
+      - net.ipv4.ip_forward=1
     environment:
       - TZ=Europe/London
-
       - VPN_SERVICE_PROVIDER=protonvpn
       - VPN_TYPE=openvpn
       - OPENVPN_USER=${PROTON_OPENVPN_USER}
       - OPENVPN_PASSWORD=${PROTON_OPENVPN_PASSWORD}
-
-      - SERVER_COUNTRIES=${PROTON_SERVER_COUNTRIES:-United Kingdom}
-      - SERVER_CITIES=${PROTON_SERVER_CITIES:-}
-
-      # Optional: Gluetun firewall/kill-switch
-      - FIREWALL=on
-
+      - SERVER_COUNTRIES=${PROTON_SERVER_COUNTRIES:-Norway}
+      - DOT=off
+      - DNS_ADDRESS=10.2.0.1
+      - FIREWALL=off
+      - VPN_IPV6=off
+    networks:
+      vpn_internal:
+        ipv4_address: 172.30.0.2
     volumes:
       - gluetun-state:/gluetun
+    healthcheck:
+      test: /gluetun-entrypoint healthcheck
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-  netsetup:
-    image: alpine:3.20
-    container_name: tailscale-vpn-policy-routing
-    network_mode: host
-    restart: unless-stopped
-    privileged: true
+  gluetun-firewall:
+    image: debian:bookworm-slim
+    container_name: gluetun-firewall
+    network_mode: "service:gluetun"
+    cap_add:
+      - NET_ADMIN
     depends_on:
-      - gluetun
-    command: >
-      sh -euxc '
-        apk add --no-cache iptables iproute2;
+      gluetun:
+        condition: service_healthy
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        apt-get update && apt-get install -y --no-install-recommends iptables >/dev/null 2>&1
+        iptables -A FORWARD -i eth0 -o tun0 -s 172.30.0.0/24 -j ACCEPT
+        iptables -A FORWARD -i tun0 -o eth0 -d 172.30.0.0/24 -m state --state RELATED,ESTABLISHED -j ACCEPT
+        iptables -t nat -A POSTROUTING -o tun0 -s 172.30.0.0/24 -j MASQUERADE
+        echo "Gluetun firewall configured"
 
-        # Exit-node forwarding
-        sysctl -w net.ipv4.ip_forward=1;
+  tailscale:
+    image: tailscale/tailscale:latest
+    container_name: tailscale-exitnode
+    restart: unless-stopped
+    hostname: proton-exitnode
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      - net.ipv4.ip_forward=1
+      - net.ipv4.conf.all.rp_filter=2
+      - net.ipv4.conf.default.rp_filter=2
+    ports:
+      - "41642:41641/udp"
+    environment:
+      - TS_AUTHKEY=${TS_AUTHKEY}
+      - TS_HOSTNAME=${TS_HOSTNAME:-proton-exitnode}
+      - TS_STATE_DIR=/var/lib/tailscale
+      - TS_SOCKET=/var/run/tailscale/tailscaled.sock
+      - TS_USERSPACE=false
+      - TS_EXTRA_ARGS=--advertise-exit-node --accept-dns=false
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - /dev/net/tun:/dev/net/tun
+    networks:
+      default:
+      vpn_internal:
+        ipv4_address: 172.30.0.3
+    depends_on:
+      gluetun:
+        condition: service_healthy
 
-        # Wait for tailscale0 (provided by host tailscaled)
-        for i in $(seq 1 60); do ip link show tailscale0 && break || sleep 1; done;
-
-        # Mark packets arriving from tailnet that are NOT destined to tailnet
-        # (i.e. typical exit-node internet traffic keeps its original public dst)
-        iptables -t mangle -C PREROUTING -i tailscale0 ! -d 100.64.0.0/10 -j MARK --set-mark 0x1 2>/dev/null ||
-          iptables -t mangle -A PREROUTING -i tailscale0 ! -d 100.64.0.0/10 -j MARK --set-mark 0x1;
-
-        # Allow forwarding from tailnet -> vpn bridge
-        iptables -C FORWARD -i tailscale0 -o br-vpnnet -j ACCEPT 2>/dev/null ||
-          iptables -A FORWARD -i tailscale0 -o br-vpnnet -j ACCEPT;
-
-        iptables -C FORWARD -i br-vpnnet -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null ||
-          iptables -A FORWARD -i br-vpnnet -o tailscale0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT;
-
-        # Policy routing: send marked packets to Gluetun gateway
-        ip rule show | grep -q "fwmark 0x1.*lookup 100" ||
-          ip rule add fwmark 0x1 table 100 priority 10000;
-
-        ip route replace default via 172.30.0.2 dev br-vpnnet table 100;
-
-        tail -f /dev/null
-      '
+  routing-setup:
+    image: debian:bookworm-slim
+    container_name: routing-setup
+    network_mode: "service:tailscale"
+    cap_add:
+      - NET_ADMIN
+    depends_on:
+      - tailscale
+      - gluetun-firewall
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - |
+        apt-get update >/dev/null 2>&1
+        apt-get install -y --no-install-recommends iptables iproute2 >/dev/null 2>&1
+        
+        echo "Waiting for tailscale0..."
+        n=0; while [ $$n -lt 60 ]; do
+          ip link show tailscale0 2>/dev/null | grep -q UP && break
+          n=$$((n+1)); sleep 2
+        done
+        
+        echo "Waiting for VPN interface..."
+        n=0; while [ $$n -lt 30 ]; do
+          VPN_IF=$$(ip -o addr show | grep "172.30.0" | head -1 | awk '{print $$2}')
+          [ -n "$$VPN_IF" ] && break
+          n=$$((n+1)); sleep 2
+        done
+        
+        if [ -z "$$VPN_IF" ]; then
+          echo "ERROR: VPN interface not found"
+          ip addr show
+          exit 1
+        fi
+        
+        echo "VPN interface: $$VPN_IF"
+        
+        ip route add default via 172.30.0.2 dev $$VPN_IF table 100
+        ip route add 10.2.0.1 via 172.30.0.2 dev $$VPN_IF
+        ip rule add fwmark 0x1/0x1 table 100 priority 100
+        
+        iptables-legacy -t mangle -A PREROUTING -i tailscale0 ! -d 100.64.0.0/10 -j MARK --set-mark 0x1
+        iptables-legacy -t nat -A POSTROUTING -o $$VPN_IF -j MASQUERADE
+        iptables-legacy -t nat -A PREROUTING -i tailscale0 -p udp --dport 53 -j DNAT --to-destination 10.2.0.1:53
+        iptables-legacy -t nat -A PREROUTING -i tailscale0 -p tcp --dport 53 -j DNAT --to-destination 10.2.0.1:53
+        
+        echo "nameserver 10.2.0.1" > /etc/resolv.conf
+        
+        echo "Split tunneling configured"
+        sleep infinity
 
 networks:
-  vpnnet:
+  vpn_internal:
     driver: bridge
-    name: vpnnet
-    driver_opts:
-      com.docker.network.bridge.name: br-vpnnet
     ipam:
       config:
         - subnet: 172.30.0.0/24
 
 volumes:
   gluetun-state:
+  tailscale-state:
