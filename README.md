@@ -146,7 +146,3 @@ docker compose down && docker compose up -d
 - Check gluetun is healthy: `docker ps`
 - Check gluetun logs: `docker logs protonvpn-gateway`
 - Verify forwarding rules: `docker exec protonvpn-gateway iptables -L FORWARD`
-
-## License
-
-MIT
